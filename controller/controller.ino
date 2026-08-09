@@ -37,6 +37,9 @@ void loop() {
 
   String data = server.readData();
   if (data.length() == 0) return;
+  if (data.length() == 1 && data.equals("x")) {
+      raise(9);
+  }
 
   int firstComma = data.indexOf(',');
   int secondComma = data.indexOf(',', firstComma + 1);

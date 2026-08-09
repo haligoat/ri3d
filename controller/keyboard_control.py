@@ -24,6 +24,7 @@ def on_press(key):
 
 def on_release(key):
     if key == keyboard.Key.esc:
+        ser.write(b'x')
         return False  # stop listener
 
 print("Press w/a/s/d to send commands. ESC to quit.")
