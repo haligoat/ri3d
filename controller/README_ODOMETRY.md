@@ -7,7 +7,7 @@ controller/
   controller.ino              robot code; ODOM_CALIBRATION_MODE lives here
   src/odometry/
     OdomConstants.h           <-- the only file you edit
-    Odometry.h / .cpp         the Kalman filter
+    Odometry.h / .cpp         the estimator
     OdomCalibration.h / .cpp  the guided calibration menu
 ```
 
@@ -18,73 +18,53 @@ sketch root or a folder with that exact name.
 
 EchoLib has no encoder support (`Motor` is open-loop MCPWM) and the BMI270 has
 no magnetometer, so wheel odometry and absolute heading are both off the table.
-What's left:
+What's left is two things:
 
-- **Gyro Z** → heading. Good; drifts a few °/min.
-- **Accelerometer** → sees *changes* in motion. Alone, double-integrates into garbage.
-- **Commanded `(x, y, turn)`** → predicts velocity while the wheels grip; lies
-  during slip, stall, or collision.
+- **Heading** comes from the gyro. This is the one genuinely good measurement.
+- **Position** comes from integrating the velocity we *asked* for — the
+  commanded `(x, y, turn)` run through the mecanum kinematics and a first-order
+  motor lag.
 
-The last two fail in opposite situations, so the filter predicts with the
-accelerometer, corrects with the command model, and snaps velocity to zero when
-the robot is provably parked (a zero-velocity update, ZUPT). Heading is not a
-filter state — it comes straight from the gyro, which keeps the filter linear.
+That's the whole estimator, about 170 lines.
+
+A Kalman filter fusing the accelerometer was tried first and dropped; it's in
+git history if you want it back. The reason is structural rather than a tuning
+failure: an accelerometer only measures *changes* in velocity, while the errors
+that dominate here — a mis-measured top speed, steady wheel slip — are
+near-constant offsets that produce no acceleration signature at all. Adding
+encoders would change that calculus completely.
 
 ## Limits — read before trusting a number
 
-| Scenario | Error |
-| --- | --- |
-| Parked 10 s | 1 mm |
-| 4 m straight / strafe / turn-then-drive | 0.2–0.6% |
-| Combined command >100% (clamping) | 0.03% |
-| Jammed on a wall at full throttle | **unreliable: 0.1 m or 3.8 m** |
-| Sustained 25% wheel slip | **31%** |
+**Position is dead reckoning.** Error only accumulates; there is no absolute
+reference to correct against. It answers "where am I relative to where I
+started", over tens of seconds — not a whole match. Re-zero with `setPose()`
+against a known reference (a wall, a field landmark) whenever you get the
+chance.
 
-**Slip is not fixable here.** An accelerometer sees only *changes* in velocity,
-so a robot steadily doing 75% of commanded speed has no acceleration signature
-at all. Loosening model trust 10× moved it 31%→26%. Don't tune it — drive within
-traction.
+**Wheel slip is invisible.** If the wheels spin without gripping, the estimate
+keeps happily integrating the speed you asked for. Same if the robot is jammed
+against a wall or another robot at full throttle, or is being pushed while
+"parked" — the pose will drift badly and nothing will flag it.
 
-**Jam detection is a coin flip.** Across 12 noise seeds it recovered on 3 and ran
-away on 9. Don't rely on the pose surviving a collision.
+**Heading drifts** a few degrees per minute, and position error grows with it.
 
-**Position is dead reckoning** — error only accumulates. Good for "where am I
-relative to where auto started", not a whole match. Re-zero with `setPose()`
-against a known reference when you can.
-
-### Is the filter worth it?
-
-Against a 15-line estimator that just integrates the commanded velocity using
-the gyro for heading:
-
-| Scenario | Simple | Kalman |
-| --- | --- | --- |
-| straight / strafe / turn / clamping | 0.0% | 0.1–0.2% |
-| stop-go | 0.0% | 1.1% |
-| 25% slip | 33.3% | 31.8% |
-| wall jam | 91.8% | 79.0% |
-
-They tie everywhere that matters. (Simple scores 0.0% partly because the
-simulation's truth model *is* the command model — on a real robot both are
-limited by how well `ODOM_MAX_FORWARD_SPEED` matches reality.) The filter's only
-real edge is collision handling, and that edge is unreliable. **If you want less
-to maintain, the simple approach gives up almost nothing.**
+**Everything scales with `ODOM_MAX_FORWARD_SPEED`.** If that's off by 20%, every
+distance is off by 20%. Calibration matters more than anything else here.
 
 ## Usage
 
 Already wired into `controller.ino`. One rule: **every `driver.drive()` must be
-matched by `odom.setCommand()` with the same arguments** — the motion model is
-built from those commands, and a stale one makes the filter predict motion that
-isn't happening.
+matched by `odom.setCommand()` with the same arguments.** The commands *are* the
+position estimate, so a stale one means an invented position.
 
 ```cpp
 IMU imu;
 MecanumOdometry odom(imu);
 
 void setup() {
-  imu.begin();          // still + level: calibrates the gyro
-  imu.calibrateAccel(); // still + level
-  odom.begin();         // latches current heading as theta = 0
+  imu.begin();    // keep the robot still: this calibrates the gyro
+  odom.begin();   // latches current heading as theta = 0
 }
 
 void loop() {
@@ -98,8 +78,7 @@ void loop() {
 odom.getX(); odom.getY();   // meters, field frame
 odom.getThetaDeg();         // CCW positive, continuous (not wrapped)
 odom.getSpeed();            // m/s
-odom.isStationary();        // ZUPT engaged
-odom.getSlipEstimate();     // m/s of model-vs-accelerometer disagreement
+odom.isStationary();        // commanding no motion (not a sensor reading)
 odom.setPose(x, y, thetaRad);
 ```
 
@@ -110,82 +89,57 @@ increases counter-clockwise, so field `+Y` is robot-left.
 
 ## IMU mounting
 
-Defaults assume the IMU's **+Y points forward, +X points right**, mounted
-**flat** (Z vertical). Flat matters — the gravity compensation assumes it, and
-no tuning fixes a sideways board.
+Mount the IMU **flat**, so its Z axis is vertical and gyro Z is the yaw axis.
+Nothing downstream can compensate for a board mounted on its side.
 
-If the board is rotated in yaw, only the axis mapping changes:
-
-| Mount | FORWARD_AXIS | FORWARD_SIGN | RIGHT_AXIS | RIGHT_SIGN |
-| --- | --- | --- | --- | --- |
-| 0° (default) | 1 (Y) | +1 | 0 (X) | +1 |
-| 90° CCW (from above) | 0 (X) | +1 | 1 (Y) | −1 |
-| 90° CW | 0 (X) | −1 | 1 (Y) | +1 |
-| 180° | 1 (Y) | −1 | 0 (X) | −1 |
-
-Rotating the board 90° CCW swings its +Y from forward to *left*, and its +X from
-right to *forward* — so forward becomes X+, and robot-right becomes −Y.
-
-`ODOM_YAW_SIGN` does **not** change: gyro Z is still vertical, and rotating a
-sensor about the axis it measures doesn't reverse that rotation's sense. Nothing
-else changes either — speeds, deadband and filter tuning are drivetrain
-properties. You also don't need to cancel the constant heading offset;
-`odom.begin()` latches whatever it reads at boot as θ = 0.
-
-Prefer calibration test 1 over this table — it measures the same four values
-empirically, and this is easy to get wrong by reasoning.
+Rotation *in yaw* needs no correction at all — `odom.begin()` latches whatever
+heading it reads at boot as θ = 0, which absorbs any fixed mounting angle. Since
+the accelerometer is never read, the board's X/Y orientation doesn't matter
+either. `ODOM_YAW_SIGN` is the only mounting-related constant, and calibration
+test 1 measures it.
 
 ## Calibration — do this before trusting any number
 
-Values in `OdomConstants.h` are **placeholders, not measurements**. Set
+The values in `OdomConstants.h` are **placeholders, not measurements**. Set
 `ODOM_CALIBRATION_MODE` to `1` in `controller.ino`, flash, open Serial at
 115200. Each `>>>` line it prints is a drop-in replacement for a line in
 `OdomConstants.h`.
 
 > The robot **drives itself** in tests 2–4. Clear floor, hand near the switch.
 
-**1 — Axis mapping.** Sets the five mounting constants. Do this first;
-everything depends on it. A wrong sign makes position run backwards, which looks
-like a broken filter but is a mounting question.
+**1 — Heading.** Confirms the IMU is flat and right side up, then has you rotate
+the robot 90° counter-clockwise to determine `ODOM_YAW_SIGN`. Applies in RAM
+immediately, but doesn't survive a reboot — paste it in and reflash.
 
-It asks you to **lift** the front, then the right side. Lift, don't tilt down: an
-accelerometer at rest reads the *up-vector*, not gravity's direction (level, it
-reads +9.8 on Z). Lifting an edge makes the axis pointing out of it read
-positive; tilting down inverts every sign.
-
-Results apply in RAM immediately so tests 2–5 work in the same session, but do
-**not** survive a reboot — paste them in and reflash.
-
-**2 / 3 — Top speed.** Drives at 100% for 1.5 s; you measure the distance. Sets
-`ODOM_MAX_FORWARD_SPEED`, `ODOM_MAX_STRAFE_SPEED`, estimates `ODOM_MOTOR_TAU`.
-Expect strafe at 0.5–0.8× forward. Cross-check with:
+**2 / 3 — Top speed.** Drives at 100% for 1.5 s; you measure the powered
+distance. Sets `ODOM_MAX_FORWARD_SPEED` and `ODOM_MAX_STRAFE_SPEED`. Expect
+strafe at 0.5–0.8× forward. Cross-check with:
 
 ```cpp
 odomWheelSpeedFromRpm(outputRpm);   // 67 mm wheels: 1 rev = 0.2105 m
 ```
 
-Pass geared output RPM, derate ~0.75 for load. Disagreement over ~25% means a
+Pass geared output RPM and derate ~0.75 for load. Disagreement over ~25% means a
 gear ratio, backwards motor, or sagging battery — not a bad tape measure.
 
-**4 — Deadband.** Ramps until the robot moves. Sets `ODOM_DEADBAND_PCT`.
+**4 — Deadband.** Ramps the command until the robot moves. Sets
+`ODOM_DEADBAND_PCT`.
 
-**5 — Drift check.** Parked 30 s; a tuned filter stays under a few cm. If it says
-ZUPT never engaged, raise `ODOM_ZUPT_ACCEL_THRESH` / `ODOM_ZUPT_YAW_RATE_THRESH`.
-
-**6 — Live pose.** Push it by hand and watch the estimate follow.
+**5 — Live pose.** Push the robot by hand and watch the estimate follow. Note
+that pushing it is exactly the case the estimator can't see, so this only
+confirms heading and signs, not distances.
 
 ## Tuning
 
-Only after calibration, one change at a time. All in `OdomConstants.h`.
+There are only four things to get right, all in `OdomConstants.h`.
 
-| Symptom | Knob |
+| Symptom | Fix |
 | --- | --- |
-| Drifts while parked | ZUPT isn't engaging — raise `ODOM_ZUPT_ACCEL_THRESH`, `ODOM_ZUPT_YAW_RATE_THRESH` |
-| Estimate lags real motion | lower `ODOM_MOTOR_TAU` |
-| Over/under-shoots distance | fix `ODOM_MAX_FORWARD_SPEED` (a scale error, not a filter problem) |
-| Overshoots after hitting things | lower `ODOM_SLIP_SCALE` |
-| Jitters on rough floor | raise `ODOM_ACCEL_NOISE` |
-| Creeps during long pushes | lower `ODOM_SLIP_MEMORY` |
+| Turns the wrong way | flip `ODOM_YAW_SIGN` |
+| Every distance off by the same ratio | fix `ODOM_MAX_FORWARD_SPEED` |
+| Strafe distances off, forward fine | fix `ODOM_MAX_STRAFE_SPEED` |
+| Estimate lags real motion, overshoots on stops | lower `ODOM_MOTOR_TAU` |
+| Creeps while sitting at a small command | raise `ODOM_DEADBAND_PCT` |
 
 ## Driver station
 

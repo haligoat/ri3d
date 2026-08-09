@@ -6,89 +6,44 @@
 #include "OdomConstants.h"
 
 // ============================================================================
-//  MecanumOdometry -- pose tracking for an EchoLib mecanum robot with NO
-//  wheel encoders.
+//  MecanumOdometry -- pose tracking with no wheel encoders.
 //
-//  WHY THIS IS SHAPED THE WAY IT IS
-//  --------------------------------
-//  EchoLib's Motor class is open-loop MCPWM: there is no encoder feedback
-//  anywhere in the library, so classic mecanum wheel odometry (integrate
-//  measured wheel rotations through the inverse kinematics) is not available.
-//  The BMI270 also has no magnetometer, so there is no absolute heading.
+//  Heading comes from the gyro. Position comes from integrating the velocity
+//  we ASKED the drivetrain for, run through the mecanum kinematics and a
+//  first-order motor lag. That's the whole thing.
 //
-//  What we DO have:
-//    1. A very good yaw *rate* (gyro Z), which integrates into a heading that
-//       drifts slowly -- good to a few degrees per minute once bias-corrected.
-//    2. Body-frame acceleration, which is unbiased over short horizons but
-//       double-integrates into garbage over long ones.
-//    3. The commanded (x, y, turn) we hand to MecanumDrive, which -- run
-//       through the drive's own kinematics and a first-order motor model --
-//       predicts body velocity well while the wheels are gripping, and lies
-//       during slip, stall, or a collision.
+//  WHY SO SIMPLE
+//  -------------
+//  A Kalman filter fusing the accelerometer was tried first and dropped (it is
+//  preserved in git history if you want it back). The reason is structural, not
+//  a tuning failure: an accelerometer measures only CHANGES in velocity, while
+//  the errors that actually dominate here -- a mis-measured top speed, steady
+//  wheel slip -- are near-constant offsets that produce no acceleration
+//  signature at all. Fusing it in cost complexity and bought almost nothing.
 //
-//  (2) and (3) fail in opposite regimes, which is exactly the situation a
-//  Kalman filter is for. We PREDICT with the accelerometer and CORRECT with
-//  the commanded-velocity model, plus a zero-velocity update (ZUPT) whenever
-//  the robot is provably parked. The ZUPT is what makes accelerometer bias
-//  observable and is the single biggest accuracy win in the whole file.
+//  So the accelerometer is not read at all. Add encoders and that calculus
+//  changes completely; the filter is worth revisiting at that point.
 //
-//  STATE (6): [ px, py, vx, vy, bx, by ]
-//    px, py  position in the FIELD frame, meters
-//    vx, vy  velocity in the FIELD frame, m/s
-//    bx, by  accelerometer bias in the BODY frame, m/s^2
-//
-//  Heading theta is NOT a filter state. It comes straight from the gyro and
-//  enters as a known time-varying rotation. That keeps the filter linear
-//  (an LTV Kalman filter, not an EKF) -- less code, no Jacobian mistakes, and
-//  it loses nothing because the gyro heading is far better than anything the
-//  accelerometer could tell us about yaw anyway.
+//  WHAT THIS IS GOOD FOR
+//    "Where am I relative to where the match started", over tens of seconds.
+//  WHAT IT IS NOT
+//    Reliable through wheel slip, collisions, or being pushed. Error only
+//    accumulates -- there is no absolute reference to correct against.
 //
 //  FRAMES
-//    Body:  +forward is the robot's front, +right is its right side. This
-//           matches MecanumDrive::drive(x, y, turn) where y = forward and
-//           x = right.
-//    Field: fixed at begin()/reset(). theta = 0 means the robot's nose points
-//           along field +X. theta increases counter-clockwise (right-handed,
-//           viewed from above), so +Y is field-left.
-//
-//  YOU MUST CALIBRATE THIS. See README_ODOMETRY.md -- the constants below are
-//  placeholders, not measurements. Set ODOM_CALIBRATION_MODE to 1 in
-//  controller.ino to get the guided procedure.
+//    Body:  +forward is the nose, +right its right side -- matching
+//           MecanumDrive::drive(x, y, turn) where y = forward, x = right.
+//    Field: fixed at begin(). theta = 0 means the nose points along field +X;
+//           theta increases counter-clockwise, so field +Y is robot-left.
 // ============================================================================
 
-// Tunables. You do not edit these here -- the values live in OdomConstants.h,
-// which is also where each one is explained and where calibration output goes.
 struct OdomConfig {
-    // IMU mounting. Axis: 0 = X, 1 = Y, 2 = Z.
-    uint8_t forwardAxis;
-    int8_t  forwardSign;
-    uint8_t rightAxis;
-    int8_t  rightSign;
-    int8_t  yawSign;
-
-    // Drivetrain model.
-    float maxForwardSpeed;   // m/s at 100% command
-    float maxStrafeSpeed;    // m/s at 100% command
-    float motorTau;          // seconds to ~63% of a step change
-    float deadbandPct;       // command percent below which nothing moves
-
-    // Filter tuning.
-    float accelNoise;        // m/s^2, 1-sigma
-    float accelBiasWalk;     // m/s^2 per sqrt(s)
-    float modelVelNoise;     // m/s
-    float modelVelNoiseTurn; // extra m/s per rad/s of rotation
-    float zuptNoise;         // m/s
-
-    // Slip / collision rejection.
-    float slipScale;         // m/s of disagreement that doubles model variance
-    float slipMemory;        // seconds before the free velocity is bled back
-
-    // Stationary (ZUPT) detection.
-    float zuptAccelThresh;   // m/s^2
-    float zuptYawRateThresh; // rad/s
-    float zuptVelThresh;     // m/s, accelerometer-only speed
-    uint32_t zuptHoldMs;
-    float zuptFilterTau;     // s, low-pass on the stationarity signals
+    // See OdomConstants.h -- that is where these live and are explained.
+    int8_t yawSign;
+    float  maxForwardSpeed;
+    float  maxStrafeSpeed;
+    float  motorTau;
+    float  deadbandPct;
 
     static OdomConfig defaults();
 };
@@ -109,102 +64,67 @@ public:
 
     explicit MecanumOdometry(IMU& imu, const OdomConfig& cfg = OdomConfig::defaults());
 
-    // Call once in setup(), AFTER imu.begin() and while the robot is still.
-    // Latches the current heading as theta = 0 and zeroes the filter.
+    // Call once in setup(), after imu.begin(). Latches the current heading as
+    // theta = 0, so a fixed IMU mounting rotation cancels itself out.
     void begin();
 
-    // Zero pose and velocity, keep the learned biases. Cheap, safe mid-match.
+    // Zero the pose. Safe mid-match.
     void reset();
 
-    // Mirror of MecanumDrive::drive(). Call with the SAME arguments, every
-    // time you call drive() -- including the zeros on a safety stop, or the
-    // model will happily keep predicting motion the robot isn't making.
+    // Mirror of MecanumDrive::drive(). Call with the SAME arguments every time
+    // you call drive(), including the zeros on a safety stop -- this IS the
+    // position estimate, so a stale command means an invented position.
     void setCommand(int x, int y, int turn);
 
-    // Run one predict/correct cycle. Call this every loop() iteration; it
-    // self-limits to updateIntervalMs and is a no-op in between.
+    // Run one step. Call every loop(); self-limits to updateIntervalMs.
     void update();
 
     Pose  getPose()     const { return pose; }
     Twist getVelocity() const;
 
-    float getX()        const { return state[0]; }
-    float getY()        const { return state[1]; }
+    float getX()        const { return pose.x; }
+    float getY()        const { return pose.y; }
     float getThetaRad() const { return pose.theta; }
     float getThetaDeg() const { return pose.theta * 57.2957795f; }
     float getSpeed()    const;
 
-    // True when ZUPT is actively holding the robot at zero velocity.
-    bool  isStationary() const { return stationary; }
+    // True when we are commanding no motion and the modelled velocity has
+    // decayed to ~zero. This is a statement about the COMMAND, not a sensor
+    // reading -- a robot being pushed while parked still reports true.
+    bool  isStationary() const;
 
-    // How far the commanded-velocity model currently disagrees with the
-    // accelerometer, m/s. Large and sustained means slipping, jammed, or
-    // being pushed. Handy to surface on the driver station.
-    float getSlipEstimate() const;
-
-    // Estimated accelerometer bias, body frame, m/s^2. Useful sanity check:
-    // it should settle to a small constant, not wander.
-    float getBiasForward() const { return state[4]; }
-    float getBiasRight()   const { return state[5]; }
-
-    // Estimated gyro Z bias, rad/s, learned during stationary periods.
-    float getGyroBias() const { return gyroBiasZ; }
-
-    // Force the pose to a known value -- e.g. from a field landmark, a wall
-    // alignment, or the start of an auto routine. Heading is in radians.
+    // Force the pose to a known value -- a field landmark, a wall alignment,
+    // the start of an auto routine. The only way to remove accumulated error.
     void setPose(float x, float y, float thetaRad);
 
-    // How often the filter steps, milliseconds. Default 10 (100 Hz).
     void setUpdateInterval(uint16_t ms) { updateIntervalMs = ms; }
-
     OdomConfig& config() { return cfg; }
 
-    // "x,y,thetaDeg,vx,vy,stationary" -- ready to hand to WiFiServerBridge.
+    // "x,y,thetaDeg,vx,vy,stationary" -- ready for WiFiServerBridge.
     String telemetry() const;
 
 private:
-    void predict(float dt, float aFwd, float aRight);
-    void correctVelocity(float zvx, float zvy, float r);
-    void updateHeading(float dt);
-    void readBodyAccel(float& aFwd, float& aRight);
-    void updateModelVelocity(float dt);
-    bool detectStationary(float aFwd, float aRight, float dt);
+    void  updateHeading();
+    void  updateModelVelocity(float dt);
 
     IMU& imu;
     OdomConfig cfg;
 
-    // Kalman filter
-    float state[6];
-    float P[6][6];
-
     Pose pose;
 
     // Heading bookkeeping
-    float headingRaw;        // unwrapped gyro heading, radians
-    float headingOffset;     // latched at begin()
-    float gyroBiasZ;         // rad/s
-    float gyroBiasCorr;      // accumulated integral of gyroBiasZ, radians
-    float lastRawDeg;        // for unwrapping the 0..360 gyro angle
-    float yawRate;           // rad/s, from finite difference
-    bool  headingInit;
+    float headingRaw;      // unwrapped gyro heading, radians
+    float headingOffset;   // latched at begin()
+    float lastRawDeg;      // for unwrapping the 0..360 gyro angle
+    float yawRate;         // rad/s
 
-    // Commanded-velocity model
+    // Commanded-velocity model, body frame
     int   cmdX, cmdY, cmdTurn;
-    float modelVFwd, modelVRight;  // body frame, m/s
-
-    // Accelerometer-only velocity, field frame. Deliberately NOT corrected by
-    // the model, so it stays an independent opinion we can cross-check.
-    float freeVx, freeVy;
-    float lastAfx, lastAfy;        // last field-frame acceleration used
-
-    // Stationary detection
-    float    accelMagLp, yawRateLp;   // filtered stationarity signals
-    bool     stationary;
-    uint32_t stillSince;
+    float modelVFwd, modelVRight;
 
     uint32_t lastUpdateUs;
-    uint16_t updateIntervalMs;
     uint32_t lastStepMs;
+    uint16_t updateIntervalMs;
     bool     started;
 };
 
