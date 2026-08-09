@@ -140,6 +140,78 @@ gear ratio, backwards motor, or sagging battery — not a bad tape measure.
 that pushing it is exactly the case the estimator can't see, so this only
 confirms heading and signs, not distances.
 
+## Autonomous
+
+`AutoDrive` gives you blocking movement primitives. **Meters, degrees, percent**
+— the same units the odometry reports, so there's only one unit system to keep
+straight.
+
+```cpp
+AutoDrive auto_(driver, odom);
+
+auto_.setAbortCheck(autoAbort);   // do this before anything moves -- see below
+
+odom.reset();                     // this pose is now the origin
+auto_.driveDistance(1.0, 40);     // 1.0 m forward at 40%, holding heading
+auto_.turnToAngle(90, 35);        // face 90 deg
+auto_.driveDistance(-0.5);        // half a metre backwards
+auto_.strafeDistance(0.3);        // 0.3 m to the right
+auto_.turnBy(45);                 // relative turn
+```
+
+Every call returns `true` only if it reached the target. **Check it** — a `false`
+means timeout, abort, or a runaway, and the pose is not where you asked:
+
+```cpp
+if (!auto_.driveDistance(1.0)) return;   // don't run the rest from a bad pose
+```
+
+Angles are **absolute field headings**, where 0 is whichever way the robot faced
+at `odom.begin()`. Absolute rather than relative so errors don't compound: three
+`turnToAngle(90)` calls all leave you at 90°, whereas three `turnBy(90)` calls
+accumulate whatever each one got wrong.
+
+### The abort hook is not optional
+
+These calls block, so `loop()` is not running while a move executes — nothing
+services the network or your kill switch unless you provide it:
+
+```cpp
+static bool autoAbort() {
+  server.processIncoming();
+  if (!server.getStatus()) return true;              // link dropped
+  String d = server.readData();
+  if (d.length() == 1 && d.equals("x")) return true; // kill switch
+  return false;
+}
+```
+
+Without it, a robot that starts a 3-second move ignores your stop command for
+all three seconds.
+
+### If the robot turns the wrong way
+
+`AUTO_TURN_SIGN` says which sign of `turn` rotates counter-clockwise. The
+default is derived from EchoLib's wheel mixing, but that assumes your motors are
+wired and numbered the way the constructor claims — so it's a guess.
+
+You don't have to reason it out. A turn heading away from its target is detected
+and aborted, and the serial output tells you to flip the constant.
+
+### What to expect
+
+**Turns are the accurate half** — closed-loop on the gyro. **Distances are dead
+reckoning**, only as good as `ODOM_MAX_FORWARD_SPEED` and only true while the
+wheels grip. So:
+
+- Keep drive segments short and re-square against a wall between them,
+  using `odom.setPose()` to re-zero.
+- Drive gently. Slip is invisible to the estimator and worst under hard
+  acceleration; half speed usually finishes closer *and* sooner because you
+  don't overshoot.
+- A blocked robot will report a move "complete" having gone nowhere. There is
+  no sensor that can tell you otherwise.
+
 ## Tuning
 
 There are only four things to get right, all in `OdomConstants.h`.
@@ -151,6 +223,17 @@ There are only four things to get right, all in `OdomConstants.h`.
 | Strafe distances off, forward fine | fix `ODOM_MAX_STRAFE_SPEED` |
 | Estimate lags real motion, overshoots on stops | lower `ODOM_MOTOR_TAU` |
 | Creeps while sitting at a small command | raise `ODOM_DEADBAND_PCT` |
+
+For autos:
+
+| Symptom | Fix |
+| --- | --- |
+| Turns spin away from the target | flip `AUTO_TURN_SIGN` |
+| Wanders off heading while driving | raise `AUTO_HEADING_KP` |
+| Oscillates around a heading | raise `AUTO_HEADING_KD`, or lower `AUTO_HEADING_KP` |
+| Overshoots the distance | lower `AUTO_DISTANCE_KP`, or drive slower |
+| Stalls just short and sits buzzing | raise `AUTO_MIN_DRIVE_PCT` / `AUTO_MIN_TURN_PCT` |
+| Declares done while still coasting | raise `AUTO_SETTLE_MS` |
 
 ## Driver station
 

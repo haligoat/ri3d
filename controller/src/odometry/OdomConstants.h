@@ -60,6 +60,54 @@ constexpr float ODOM_DEADBAND_PCT = 8.0f;
 
 
 // ---------------------------------------------------------------------------
+//  3. AUTONOMOUS              (AutoDrive.h)
+// ---------------------------------------------------------------------------
+//  Which sign of the `turn` argument to MecanumDrive::drive() rotates the robot
+//  COUNTER-CLOCKWISE, i.e. in the direction that increases getThetaDeg().
+//
+//  From EchoLib's mixing (FL = y+x+turn, FR = y-x-turn) a positive turn drives
+//  the left wheels forward and the right wheels back, which is a CLOCKWISE
+//  spin -- hence -1. But that assumes your motors are wired and numbered the
+//  way the constructor says, so treat it as a starting guess.
+//
+//  You do NOT have to get this right by reasoning: a turn that runs away is
+//  detected and aborted, and the serial output tells you to flip this.
+constexpr int8_t AUTO_TURN_SIGN = -1;
+
+//  Heading-hold gains. Percent of drive command per degree of error, and per
+//  degree/second of error rate. Raise P if it wanders off heading; raise D if
+//  it oscillates around the target.
+constexpr float AUTO_HEADING_KP = 1.2f;
+constexpr float AUTO_HEADING_KD = 0.08f;
+
+//  Distance controller: percent of drive command per meter of remaining
+//  distance. This is what decelerates the robot into the target.
+constexpr float AUTO_DISTANCE_KP = 220.0f;
+
+//  How close counts as arrived.
+constexpr float AUTO_DISTANCE_TOLERANCE = 0.04f;   // meters
+constexpr float AUTO_ANGLE_TOLERANCE    = 3.0f;    // degrees
+
+//  Minimum command actually sent while a move is still running. Below the
+//  drivetrain deadband the robot stalls short of the target and sits there
+//  buzzing until the timeout, so the controller floors its output here.
+constexpr float AUTO_MIN_DRIVE_PCT = 18.0f;
+constexpr float AUTO_MIN_TURN_PCT  = 16.0f;
+
+//  Ceiling on the heading correction mixed into a straight drive, percent.
+//  Keeps a heading fight from overwhelming forward motion.
+constexpr float AUTO_MAX_HEADING_CORRECTION = 25.0f;
+
+//  A move must hold its tolerance this long before it counts as finished --
+//  stops a fast approach from declaring victory as it flies past.
+constexpr uint32_t AUTO_SETTLE_MS = 150;
+
+//  Safety: if a turn's error grows by this many degrees instead of shrinking,
+//  AUTO_TURN_SIGN is backwards. The move aborts rather than spinning forever.
+constexpr float AUTO_RUNAWAY_DEG = 25.0f;
+
+
+// ---------------------------------------------------------------------------
 //  Helper: wheel surface speed from output-shaft RPM.
 //  Pass geared output RPM (free speed / gear ratio) and derate ~0.75 for load;
 //  a motor under a robot never reaches its free speed.

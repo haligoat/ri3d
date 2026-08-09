@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include "src/odometry/Odometry.h"
 #include "src/odometry/OdomCalibration.h"
+#include "src/odometry/AutoDrive.h"
 
 // Set to 1 to boot into the guided odometry calibration menu instead of the
 // normal robot code. See README_ODOMETRY.md.
@@ -15,8 +16,35 @@ MotorControllers motors;
 MecanumDrive driver(motors, 1, 3, 4, 2); // fl, fr, bl, br
 IMU imu;
 MecanumOdometry odom(imu);
+AutoDrive auto_(driver, odom);
 
 static unsigned long lastTelemetry = 0;
+
+// AutoDrive's moves block, so loop() is not running while one executes. Without
+// this hook nothing would service the network or honour the kill switch for the
+// whole duration of a move. Returning true stops the move immediately.
+static bool autoAbort() {
+  server.processIncoming();
+  if (!server.getStatus()) return true;              // link dropped
+  String d = server.readData();
+  if (d.length() == 1 && d.equals("x")) return true; // kill switch
+  return false;
+}
+
+// Example routine. Every call is checked: if a move fails (timeout, abort, or a
+// runaway turn) the rest of the sequence is skipped rather than run from a pose
+// we know is wrong.
+static void runAuto() {
+  Serial.println("AUTO: start");
+  odom.reset();                       // this pose is now the origin
+
+  if (!auto_.driveDistance(1.0, 40)) return;
+  if (!auto_.turnToAngle(90, 35))     return;
+  if (!auto_.driveDistance(0.5, 40))  return;
+  if (!auto_.turnToAngle(0, 35))      return;
+
+  Serial.println("AUTO: done");
+}
 
 void setup() {
   Serial.begin(115200);
@@ -40,6 +68,8 @@ void setup() {
   server.enableDebug(true);
   server.setTimeoutConnectionDependent(true);
   server.begin();
+
+  auto_.setAbortCheck(autoAbort);
 
   driver.setBrake();
   Serial.println("=== BOOT COMPLETE ===");
@@ -65,6 +95,13 @@ void loop() {
   }
 
   String data = server.readData();
+
+  if (data.equals("auto")) {
+    runAuto();
+    driver.drive(0, 0, 0);
+    odom.setCommand(0, 0, 0);
+    return;
+  }
 
   if (data.length() == 1 && data.equals("x")) {
     driver.drive(0, 0, 0);  // stop the wheels before aborting
