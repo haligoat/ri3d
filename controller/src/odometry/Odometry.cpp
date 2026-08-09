@@ -32,6 +32,7 @@ OdomConfig OdomConfig::defaults() {
     c.zuptYawRateThresh = ODOM_ZUPT_YAW_RATE_THRESH;
     c.zuptVelThresh     = ODOM_ZUPT_VEL_THRESH;
     c.zuptHoldMs        = ODOM_ZUPT_HOLD_MS;
+    c.zuptFilterTau     = ODOM_ZUPT_FILTER_TAU;
 
     return c;
 }
@@ -51,6 +52,7 @@ MecanumOdometry::MecanumOdometry(IMU& imu_, const OdomConfig& cfg_)
     modelVFwd = modelVRight = 0.0f;
     freeVx = freeVy = 0.0f;
     lastAfx = lastAfy = 0.0f;
+    accelMagLp = yawRateLp = 0.0f;
     stationary = false;
     stillSince = 0;
     lastUpdateUs = 0;
@@ -199,17 +201,29 @@ void MecanumOdometry::updateModelVelocity(float dt) {
 // ---------------------------------------------------------------------------
 //  Stationary detection
 // ---------------------------------------------------------------------------
-bool MecanumOdometry::detectStationary(float aFwd, float aRight) {
+bool MecanumOdometry::detectStationary(float aFwd, float aRight, float dt) {
     // Test the BIAS-CORRECTED acceleration, not the raw reading. A real
     // accelerometer bias is easily 0.3 m/s^2, which on its own sits close to
-    // zuptAccelThresh -- judging the raw signal makes ZUPT flicker on exactly
+    // the threshold -- judging the raw signal makes ZUPT flicker on exactly
     // the robots whose bias most needs correcting.
     float cFwd   = aFwd   - state[4];
     float cRight = aRight - state[5];
     float aMag = sqrtf(cFwd * cFwd + cRight * cRight);
 
-    bool quiet = aMag < cfg.zuptAccelThresh
-              && fabsf(yawRate) < cfg.zuptYawRateThresh;
+    // Low-pass before comparing. This is not cosmetic: chassis vibration puts
+    // individual samples well above the threshold even when parked, and since
+    // any one sample over the line restarts the zuptHoldMs timer, an
+    // instantaneous test can keep ZUPT from EVER latching. Measured on the
+    // wall-jam case, the unfiltered version engaged on only 4 of 12 noise
+    // seeds; filtered, it is deterministic. The noise is zero-mean, so
+    // averaging removes it while leaving real motion intact.
+    float alpha = dt / cfg.zuptFilterTau;
+    if (alpha > 1.0f) alpha = 1.0f;
+    accelMagLp += (aMag - accelMagLp) * alpha;
+    yawRateLp  += (fabsf(yawRate) - yawRateLp) * alpha;
+
+    bool quiet = accelMagLp < cfg.zuptAccelThresh
+              && yawRateLp  < cfg.zuptYawRateThresh;
 
     // "Not accelerating and not turning" is also true of a robot cruising at a
     // constant speed, so it cannot decide this on its own. The accelerometer-
@@ -385,7 +399,7 @@ void MecanumOdometry::update() {
 
     predict(dt, aFwd, aRight);
 
-    stationary = detectStationary(aFwd, aRight);
+    stationary = detectStationary(aFwd, aRight, dt);
 
     // Model velocity in the field frame. Needed here (not just in the update
     // branch) because the slip measure below feeds ZUPT detection too.

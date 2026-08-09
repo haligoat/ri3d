@@ -124,6 +124,13 @@ constexpr float    ODOM_ZUPT_VEL_THRESH      = 0.18f;  // m/s
 //  How long the above must hold before we trust it, milliseconds.
 constexpr uint32_t ODOM_ZUPT_HOLD_MS         = 120;
 
+//  Low-pass time constant on the stationarity signals, seconds. Vibration puts
+//  single samples over the threshold even when parked, and one stray sample
+//  restarts the hold timer -- without this filtering, ZUPT may never latch at
+//  all. Raise it if ZUPT is flaky on a rough chassis; lower it if ZUPT is slow
+//  to notice the robot has stopped.
+constexpr float    ODOM_ZUPT_FILTER_TAU      = 0.20f;
+
 
 // ---------------------------------------------------------------------------
 //  Helper: wheel surface speed from output-shaft RPM.

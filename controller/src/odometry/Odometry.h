@@ -88,6 +88,7 @@ struct OdomConfig {
     float zuptYawRateThresh; // rad/s
     float zuptVelThresh;     // m/s, accelerometer-only speed
     uint32_t zuptHoldMs;
+    float zuptFilterTau;     // s, low-pass on the stationarity signals
 
     static OdomConfig defaults();
 };
@@ -167,7 +168,7 @@ private:
     void updateHeading(float dt);
     void readBodyAccel(float& aFwd, float& aRight);
     void updateModelVelocity(float dt);
-    bool detectStationary(float aFwd, float aRight);
+    bool detectStationary(float aFwd, float aRight, float dt);
 
     IMU& imu;
     OdomConfig cfg;
@@ -197,6 +198,7 @@ private:
     float lastAfx, lastAfy;        // last field-frame acceleration used
 
     // Stationary detection
+    float    accelMagLp, yawRateLp;   // filtered stationarity signals
     bool     stationary;
     uint32_t stillSince;
 
