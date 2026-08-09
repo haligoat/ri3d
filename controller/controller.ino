@@ -23,10 +23,9 @@ void setup() {
   delay(1000);
   Serial.println("=== BOOT: starting IMU ===");
 
-  // Must be still and level for this: begin() calibrates the gyro and the
-  // accelerometer calibration below needs a flat reference.
+  // Must be still for this -- begin() calibrates the gyro. The accelerometer
+  // is never read by the odometry, so it needs no calibration.
   imu.begin();
-  imu.calibrateAccel();
 
   odom.begin();
   Serial.println("=== IMU + odometry ready ===");
