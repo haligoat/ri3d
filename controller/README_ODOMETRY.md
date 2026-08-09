@@ -20,12 +20,23 @@ EchoLib has no encoder support (`Motor` is open-loop MCPWM) and the BMI270 has
 no magnetometer, so wheel odometry and absolute heading are both off the table.
 What's left is two things:
 
-- **Heading** comes from the gyro. This is the one genuinely good measurement.
+- **Heading** comes from the IMU's gyro, read every cycle at 100 Hz. This is the
+  one genuinely good measurement in the system.
 - **Position** comes from integrating the velocity we *asked* for — the
   commanded `(x, y, turn)` run through the mecanum kinematics and a first-order
   motor lag.
 
 That's the whole estimator, about 170 lines.
+
+> **The IMU is essential — half of it.** The BMI270 is two sensors in one chip.
+> The **gyroscope** is the backbone of this estimator. The **accelerometer** is
+> not used at all (outside a one-time mounting check in calibration). So "we
+> dropped the accelerometer" is not "we dropped the IMU".
+>
+> Heading matters more than any other single number here, because an error in it
+> rotates every metre you drive afterwards. It's also the only part of the
+> estimate that *observes* the robot rather than assuming the motors did what
+> they were told — if a wheel slips through a turn, heading still tracks.
 
 A Kalman filter fusing the accelerometer was tried first and dropped; it's in
 git history if you want it back. The reason is structural rather than a tuning
