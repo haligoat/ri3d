@@ -104,8 +104,18 @@ void loop() {
   }
 
   if (data.length() == 1 && data.equals("x")) {
-    driver.drive(0, 0, 0);  // stop the wheels before aborting
-    raise(9);
+    // Emergency stop: halt the wheels and keep the odometry model in sync,
+    // but don't crash/reboot the board -- that would drop the WiFi
+    // connection and reset the pose estimate, which defeats the point of a
+    // stop command during normal operation.
+    driver.drive(0, 0, 0);
+    odom.setCommand(0, 0, 0);
+    odom.update();
+    if (millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
+      lastTelemetry = millis();
+      server.sendData("ODOM," + odom.telemetry());
+    }
+    return;
   }
 
   if (data.length() > 0) {

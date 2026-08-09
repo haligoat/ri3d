@@ -9,7 +9,7 @@ from pynput import keyboard
 
 ECHO_IP = "192.168.4.1"
 ECHO_PORT = 8888
-SPEED = 50
+SPEED = 12
 
 # WiFiServerBridge drops the connection (and hard-stops the motors) after 2 s
 # without a packet, so a held key has to be re-sent, not sent once. The

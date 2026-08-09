@@ -83,19 +83,22 @@ void MecanumOdometry::updateModelVelocity(float dt) {
     // MotorControllers::percentToCycle(). Above a combined 100 that clamping
     // silently distorts the motion, so the model has to clamp too or it
     // over-predicts speed on exactly the aggressive commands that matter.
-    float FL = (float)(cmdY + cmdX + cmdTurn);
-    float FR = (float)(cmdY - cmdX - cmdTurn);
-    float BL = (float)(cmdY - cmdX + cmdTurn);
-    float BR = (float)(cmdY + cmdX - cmdTurn);
+    // Note: local vars can't be named FL/FR/BL/BR -- BR collides with a
+    // register-name macro (BR == 4) defined deep in the Xtensa toolchain
+    // headers pulled in via Arduino.h, which breaks compilation.
+    float flCmd = (float)(cmdY + cmdX + cmdTurn);
+    float frCmd = (float)(cmdY - cmdX - cmdTurn);
+    float blCmd = (float)(cmdY - cmdX + cmdTurn);
+    float brCmd = (float)(cmdY + cmdX - cmdTurn);
 
-    FL = constrain(FL, -100.0f, 100.0f);
-    FR = constrain(FR, -100.0f, 100.0f);
-    BL = constrain(BL, -100.0f, 100.0f);
-    BR = constrain(BR, -100.0f, 100.0f);
+    flCmd = constrain(flCmd, -100.0f, 100.0f);
+    frCmd = constrain(frCmd, -100.0f, 100.0f);
+    blCmd = constrain(blCmd, -100.0f, 100.0f);
+    brCmd = constrain(brCmd, -100.0f, 100.0f);
 
     // Forward kinematics -- invert the mixing above.
-    float effFwd   = (FL + FR + BL + BR) * 0.25f;
-    float effRight = (FL - FR - BL + BR) * 0.25f;
+    float effFwd   = (flCmd + frCmd + blCmd + brCmd) * 0.25f;
+    float effRight = (flCmd - frCmd - blCmd + brCmd) * 0.25f;
 
     if (fabsf(effFwd)   < cfg.deadbandPct) effFwd   = 0.0f;
     if (fabsf(effRight) < cfg.deadbandPct) effRight = 0.0f;

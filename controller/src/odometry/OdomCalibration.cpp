@@ -1,6 +1,6 @@
 #include "OdomCalibration.h"
 
-static void waitForEnter(const char* prompt) {
+static void waitForEnter(const __FlashStringHelper* prompt) {
     Serial.println();
     Serial.println(prompt);
     while (Serial.available()) Serial.read();
