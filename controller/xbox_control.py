@@ -25,6 +25,11 @@ RB_BUTTON = int(os.environ.get("RB_BUTTON", "5"))
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.settimeout(0.5)
 
+# Local telemetry dashboard (telemetry_server.py). Loopback only.
+DASHBOARD_ADDR = (os.environ.get("DASHBOARD_HOST", "127.0.0.1"),
+                  int(os.environ.get("DASHBOARD_PORT", "9999")))
+telemetry_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
 running = True
 latest_pose = None
 state_lock = threading.Lock()
@@ -32,7 +37,18 @@ current_state = (0, 0, 0, 0)
 
 
 def apply_deadzone(v):
-    return 0.0 if abs(v) < DEADZONE else v
+    """Deadzone with rescaling, so output is proportional to stick travel.
+
+    A plain cutoff makes power jump straight to DEADZONE*SPEED the instant the
+    stick clears the threshold -- 15% power from a barely-moved stick. Rescaling
+    the remaining range back to 0..1 means power ramps from zero at the edge of
+    the deadzone up to full at the rail.
+    """
+    magnitude = abs(v)
+    if magnitude < DEADZONE:
+        return 0.0
+    scaled = (magnitude - DEADZONE) / (1.0 - DEADZONE)
+    return scaled if v > 0 else -scaled
 
 
 def rumble(joystick, low, high, ms):
@@ -80,6 +96,17 @@ def receive_loop():
             latest_pose = tuple(float(v) for v in parts[1:6]) + (parts[6] == "1",)
         except ValueError:
             continue
+
+        # Mirror to the local dashboard. Deliberately forwarded from here
+        # rather than having the web server talk to the board: the firmware
+        # replies to whichever client sent last, so a second UDP client would
+        # steal telemetry from this process -- and its packets would satisfy
+        # the firmware's clientConnected() check, keeping the robot armed with
+        # no driver station attached.
+        try:
+            telemetry_sock.sendto(msg.encode(), DASHBOARD_ADDR)
+        except OSError:
+            pass  # dashboard down is not a driving problem
 
 
 def display_loop():

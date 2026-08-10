@@ -25,7 +25,7 @@ const char* WIFI_PASSWORD = "alex2009";
 
 // Set to 1 to boot into the guided odometry calibration menu instead of the
 // normal robot code. See README_ODOMETRY.md.
-#define ODOM_CALIBRATION_MODE 0
+#define ODOM_CALIBRATION_MODE 1
 
 // How often to push a pose packet back to the driver station, milliseconds.
 #define TELEMETRY_INTERVAL_MS 100
@@ -55,6 +55,210 @@ void sendToClient(const String& msg) {
   udp.beginPacket(lastClientIP, lastClientPort);
   udp.print(msg);
   udp.endPacket();
+}
+
+// ---- Status LEDs ----------------------------------------------------------
+// A driver looking at the robot needs to know the link state without reading a
+// screen. "Connected" means the whole chain is up: WiFi associated AND the
+// driver station heard from recently. WiFi alone is not enough -- an
+// associated board with a dead client cannot be driven.
+//
+// Both LEDs are driven every loop rather than only on transitions, so a glitch
+// can never leave them lying about the state.
+#define LED_CONNECTED_PIN    42
+#define LED_DISCONNECTED_PIN 41
+
+#if ODOM_CALIBRATION_MODE
+// runOdometryCalibration() never returns, so loop() -- and therefore
+// serviceStatusLeds() -- never runs in calibration mode. A blink driven from
+// the main flow is impossible. This task owns the LED instead, so it keeps
+// flashing no matter how long the calibration routine blocks.
+#define CALIB_BLINK_MS 250
+
+static void calibrationBlinkTask(void* /*unused*/) {
+  for (;;) {
+    digitalWrite(LED_CONNECTED_PIN, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(CALIB_BLINK_MS));
+    digitalWrite(LED_CONNECTED_PIN, LOW);
+    vTaskDelay(pdMS_TO_TICKS(CALIB_BLINK_MS));
+  }
+}
+#endif
+
+static void serviceStatusLeds() {
+  const bool linkUp = (WiFi.status() == WL_CONNECTED) && clientConnected();
+  digitalWrite(LED_CONNECTED_PIN,    linkUp ? HIGH : LOW);
+  digitalWrite(LED_DISCONNECTED_PIN, linkUp ? LOW  : HIGH);
+}
+
+// ---- Teleop heading hold (PID) --------------------------------------------
+// Closes a loop around the gyro so the robot drives the heading you left it
+// on. Without this, driving "straight" is open-loop hope: uneven motors, a
+// dragging wheel or carpet nap all yaw the robot slowly and the driver spends
+// the match correcting by hand.
+//
+// This controls HEADING, not speed, and that is not a stylistic choice --
+// there are no encoders (Motor is open-loop MCPWM), so commanded velocity is
+// the only "velocity" available. A PID on that would be feeding back its own
+// output. Heading is the one quantity actually measured, via the gyro.
+//
+// Only active while the driver is NOT commanding a turn. The moment the turn
+// stick moves, the driver owns the heading and we re-latch the target to
+// wherever they leave it.
+#define HEADING_HOLD_ENABLED   1
+#define HEADING_KP             1.6f
+#define HEADING_KI             0.0f   // start at zero; see the note below
+#define HEADING_KD             0.10f
+#define HEADING_MAX_CORRECTION 35     // percent turn command, clamped
+#define HEADING_DEADBAND_DEG   1.0f   // ignore noise; do not chase the gyro
+#define HEADING_I_LIMIT        10.0f  // anti-windup clamp on the I accumulator
+
+static float headingTarget   = 0.0f;
+static bool  headingHoldArmed = false;
+static float headingErrSum   = 0.0f;
+static float headingLastErr  = 0.0f;
+static unsigned long headingLastMs = 0;
+
+// Shortest signed distance between two headings, in degrees.
+static float headingError(float target, float actual) {
+  float e = target - actual;
+  while (e > 180.0f)  e -= 360.0f;
+  while (e < -180.0f) e += 360.0f;
+  return e;
+}
+
+static void releaseHeadingHold() {
+  headingHoldArmed = false;
+  headingErrSum = 0.0f;
+  headingLastErr = 0.0f;
+}
+
+// Returns the turn command to actually send: the driver's own turn when they
+// are steering, or a correction when they are not.
+static int applyHeadingHold(int x, int y, int turn) {
+#if !HEADING_HOLD_ENABLED
+  return turn;
+#else
+  const bool driverSteering = (turn != 0);
+  const bool moving         = (x != 0 || y != 0);
+
+  if (driverSteering || !moving) {
+    // Driver owns the heading, or we are parked. Re-latch continuously so the
+    // target is current the instant they let go.
+    headingTarget = odom.getThetaDeg();
+    releaseHeadingHold();
+    return turn;
+  }
+
+  unsigned long now = millis();
+
+  if (!headingHoldArmed) {
+    // First loop of a hold: latch the target and seed the derivative, so the
+    // D term does not spike off a bogus first sample.
+    headingTarget = odom.getThetaDeg();
+    headingHoldArmed = true;
+    headingLastErr = 0.0f;
+    headingErrSum = 0.0f;
+    headingLastMs = now;
+    return 0;
+  }
+
+  float dt = (now - headingLastMs) / 1000.0f;
+  headingLastMs = now;
+  if (dt <= 0.0f || dt > 0.5f) {
+    // A stalled or absurd dt means a hiccup in the link; skip this sample
+    // rather than feeding a garbage derivative into the loop.
+    return 0;
+  }
+
+  float err = headingError(headingTarget, odom.getThetaDeg());
+
+  if (fabsf(err) < HEADING_DEADBAND_DEG) {
+    headingLastErr = err;
+    return 0;
+  }
+
+  headingErrSum += err * dt;
+  headingErrSum = constrain(headingErrSum, -HEADING_I_LIMIT, HEADING_I_LIMIT);
+
+  float derivative = (err - headingLastErr) / dt;
+  headingLastErr = err;
+
+  float output = HEADING_KP * err
+               + HEADING_KI * headingErrSum
+               + HEADING_KD * derivative;
+
+  return (int)constrain(output, -(float)HEADING_MAX_CORRECTION,
+                                 (float)HEADING_MAX_CORRECTION);
+#endif
+}
+
+// ---- Active braking -------------------------------------------------------
+// Cutting power to a mecanum drive leaves it coasting on its own momentum. To
+// actually stop, we drive the motors backwards briefly ("plugging") and then
+// release. The pulse is triggered on a release-to-zero or a direction reversal.
+//
+// This is done here rather than on the driver station because it is timing
+// critical: the control link runs at 90-800ms of jitter, so a reverse pulse
+// scheduled from the Pi would land at an unpredictable moment. On the board it
+// is deterministic.
+//
+// BRAKE_SCALE is a percentage of the speed the robot was doing. Too high and
+// the robot snaps backwards; too low and it still drifts. Start conservative.
+#define BRAKE_SCALE   60    // percent of previous command, applied in reverse
+#define BRAKE_MS      70    // how long to hold the reverse pulse
+// Commands smaller than this were not carrying enough momentum to be worth
+// braking, and pulsing on them just makes the robot feel twitchy.
+#define BRAKE_MIN_CMD 20
+
+static int lastX = 0, lastY = 0, lastTurn = 0;
+static unsigned long brakeUntil = 0;
+static int brakeX = 0, brakeY = 0, brakeTurn = 0;
+static int pendingX = 0, pendingY = 0, pendingTurn = 0;
+
+// True when an axis is being told to stop or to flip direction while it was
+// carrying real speed.
+static bool needsBrake(int prev, int next) {
+  if (abs(prev) < BRAKE_MIN_CMD) return false;
+  if (next == 0) return true;                       // released
+  return (prev > 0) != (next > 0);                  // reversed
+}
+
+static int brakeComponent(int prev, int next) {
+  return needsBrake(prev, next) ? -(prev * BRAKE_SCALE) / 100 : next;
+}
+
+// Single entry point for every drive command, so odometry and the brake state
+// machine cannot drift out of sync with what the motors are actually doing.
+static void applyDrive(int x, int y, int turn) {
+  if (needsBrake(lastX, x) || needsBrake(lastY, y) || needsBrake(lastTurn, turn)) {
+    brakeX    = brakeComponent(lastX, x);
+    brakeY    = brakeComponent(lastY, y);
+    brakeTurn = brakeComponent(lastTurn, turn);
+    pendingX = x; pendingY = y; pendingTurn = turn;
+    brakeUntil = millis() + BRAKE_MS;
+
+    driver.drive(brakeX, brakeY, brakeTurn);
+    odom.setCommand(brakeX, brakeY, brakeTurn);
+  } else {
+    // Heading correction is applied to the OUTPUT only. The brake state below
+    // still tracks the driver's own turn, so a small PID correction can never
+    // look like a direction reversal and trigger a spurious brake pulse.
+    int outTurn = applyHeadingHold(x, y, turn);
+    driver.drive(x, y, outTurn);
+    odom.setCommand(x, y, outTurn);
+  }
+
+  lastX = x; lastY = y; lastTurn = turn;
+}
+
+// Ends the reverse pulse on time. Called every loop, so the pulse length does
+// not depend on when the next packet happens to arrive.
+static void serviceBrake() {
+  if (brakeUntil == 0 || millis() < brakeUntil) return;
+  brakeUntil = 0;
+  driver.drive(pendingX, pendingY, pendingTurn);
+  odom.setCommand(pendingX, pendingY, pendingTurn);
 }
 
 // Motor 5 is not part of the drivetrain (MecanumDrive owns 1-4), so it is
@@ -169,6 +373,13 @@ static void serviceWiFi() {
 
 void setup() {
   Serial.begin(115200);
+
+  // Set up before anything can block, so the disconnected LED is lit for the
+  // whole boot rather than coming on only once WiFi has failed.
+  pinMode(LED_CONNECTED_PIN, OUTPUT);
+  pinMode(LED_DISCONNECTED_PIN, OUTPUT);
+  digitalWrite(LED_CONNECTED_PIN, LOW);
+  digitalWrite(LED_DISCONNECTED_PIN, HIGH);
   delay(1000);
   Serial.println("=== BOOT: starting IMU ===");
 
@@ -181,6 +392,12 @@ void setup() {
 
 #if ODOM_CALIBRATION_MODE
   driver.setBrake();
+  // Green flashing = in calibration, not driving. The disconnected LED is
+  // cleared first so the pair cannot be read as a link state, which is what
+  // they mean in every other mode.
+  digitalWrite(LED_DISCONNECTED_PIN, LOW);
+  xTaskCreate(calibrationBlinkTask, "calibBlink", 2048, nullptr, 1, nullptr);
+
   runOdometryCalibration(imu, driver, odom);  // never returns
 #endif
 
@@ -208,6 +425,7 @@ void setup() {
 
 void loop() {
   serviceWiFi();
+  serviceStatusLeds();
 
   int packetSize = udp.parsePacket();
   if (packetSize > 0) {
@@ -222,12 +440,16 @@ void loop() {
 
     if (data.equals("auto")) {
       runAuto();
-      driver.drive(0, 0, 0);
-      odom.setCommand(0, 0, 0);
+      applyDrive(0, 0, 0);
       return;
     }
 
     if (data.length() == 1 && data.equals("x")) {
+      // Hard stop, deliberately NOT routed through applyDrive: a kill switch
+      // must cut power immediately, not spin the motors backwards first.
+      brakeUntil = 0;
+      lastX = lastY = lastTurn = 0;
+      releaseHeadingHold();   // no PID output should survive a kill
       driver.drive(0, 0, 0);
       setAuxMotor(false);   // the kill switch has to kill everything, not just the drivetrain
       odom.setCommand(0, 0, 0);
@@ -262,17 +484,22 @@ void loop() {
       Serial.print(" turn=");
       Serial.println(turn);
 
-      driver.drive(x, y, turn);
-      // The filter's motion model is built from the commands we send, so this
-      // has to track every drive() call or the model silently goes stale.
-      odom.setCommand(x, y, turn);
+      // applyDrive owns both the motors and the odometry command: the filter's
+      // motion model is built from what we send, so it has to see the brake
+      // pulse too or the model silently goes stale.
+      applyDrive(x, y, turn);
     }
   }
 
+  serviceBrake();
+
   if (!clientConnected()) {
-    driver.drive(0, 0, 0);  // safety stop if client disconnects
+    // Safety stop if the client disconnects. Routed through applyDrive so the
+    // robot brakes to a halt rather than coasting away on its last command.
+    // Skipped while a pulse is in flight -- this branch runs every loop, and
+    // re-issuing zero would cancel the brake it just started.
+    if (brakeUntil == 0) applyDrive(0, 0, 0);
     setAuxMotor(false);     // a held bumper must not latch on when the link dies
-    odom.setCommand(0, 0, 0);
   }
 
   // Runs every loop; the filter self-limits to its own update interval.

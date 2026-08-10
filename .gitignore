@@ -1,2 +1,4 @@
 controller/build/
 controller/__pycache__/
+.DS_Store
+*.pyc
