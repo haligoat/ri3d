@@ -25,7 +25,7 @@ const char* WIFI_PASSWORD = "alex2009";
 
 // Set to 1 to boot into the guided odometry calibration menu instead of the
 // normal robot code. See README_ODOMETRY.md.
-#define ODOM_CALIBRATION_MODE 1
+#define ODOM_CALIBRATION_MODE 0
 
 // How often to push a pose packet back to the driver station, milliseconds.
 #define TELEMETRY_INTERVAL_MS 100

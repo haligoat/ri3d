@@ -289,6 +289,154 @@ static void testDeadbandAuto(IMU& imu, MecanumDrive& drive) {
 }
 
 // ---------------------------------------------------------------------------
+//  Test 7 -- motor time constant (tau), measured from a step response
+// ---------------------------------------------------------------------------
+//  ODOM_MOTOR_TAU is the time to reach ~63% of a commanded step change. Test 2
+//  currently ASSUMES this value in order to back out top speed, so a wrong tau
+//  quietly biases the speed calibration too -- worth measuring rather than
+//  guessing.
+//
+//  Measured on the TURN axis because the gyro reports rotation RATE directly.
+//  That is exactly the quantity a first-order step response is defined over.
+//  The drive axis has no such sensor: with no encoders, forward velocity would
+//  have to be integrated from the accelerometer, and integrating that noise
+//  over seconds is precisely what Odometry.h rejected for position.
+//
+//  CAVEAT, and it is a real one: this measures the ROTATIONAL time constant.
+//  Rotational and translational inertia are not the same, so the drivetrain's
+//  forward tau can differ. It is the same motors, gearing and mass, so it is a
+//  well-founded estimate -- but treat it as a good starting value, then adjust
+//  if the pose estimate visibly leads or lags real motion.
+//
+//  Both directions are measured. Rise and decay should be similar for a
+//  first-order system; if they are not, the model is a poor fit for this
+//  drivetrain and that is worth knowing.
+#define TAU_TEST_PCT   60     // well clear of the deadband, short of top speed
+#define TAU_RUN_MS     2500   // long enough to reach a steady rate
+#define TAU_COAST_MS   2500
+#define TAU_SAMPLE_MS  20
+
+struct TauResult {
+    float rise;    // seconds to 63.2% of steady-state rate
+    float decay;   // seconds to fall to 36.8% after power is cut
+    float steady;  // deg/s reached
+    bool  ok;
+};
+
+static TauResult measureTauOnce(IMU& imu, MecanumDrive& drive) {
+    TauResult r = {0, 0, 0, false};
+
+    // --- spin up, recording the rate curve ---
+    const int N = TAU_RUN_MS / TAU_SAMPLE_MS;
+    static float rate[TAU_RUN_MS / TAU_SAMPLE_MS];
+    float prevYaw = imu.getGyroZdeg();
+    uint32_t prevMs = millis();
+    float smooth = 0.0f;
+
+    for (int i = 0; i < N; i++) {
+        drive.drive(0, 0, TAU_TEST_PCT);
+        delay(TAU_SAMPLE_MS);
+        uint32_t now = millis();
+        float dt = (now - prevMs) / 1000.0f;
+        float yaw = imu.getGyroZdeg();
+        float inst = (dt > 0.0f) ? fabsf(yawDelta(prevYaw, yaw)) / dt : 0.0f;
+        prevYaw = yaw; prevMs = now;
+        // Light smoothing: raw gyro differences are noisy enough that a single
+        // spike could satisfy the 63% crossing far too early.
+        smooth = (i == 0) ? inst : (0.7f * smooth + 0.3f * inst);
+        rate[i] = smooth;
+    }
+
+    // Steady state = mean of the last 600 ms, by which point a sane drivetrain
+    // has settled.
+    int tailStart = N - (600 / TAU_SAMPLE_MS);
+    if (tailStart < 1) tailStart = 1;
+    float ss = 0.0f;
+    for (int i = tailStart; i < N; i++) ss += rate[i];
+    ss /= (N - tailStart);
+    r.steady = ss;
+
+    if (ss < 20.0f) {
+        drive.drive(0, 0, 0);
+        Serial.println(F("  !! barely rotating -- raise TAU_TEST_PCT or check power."));
+        return r;
+    }
+
+    for (int i = 0; i < N; i++) {
+        if (rate[i] >= 0.632f * ss) { r.rise = (i * TAU_SAMPLE_MS) / 1000.0f; break; }
+    }
+
+    // --- cut power and record the decay ---
+    drive.drive(0, 0, 0);
+    prevYaw = imu.getGyroZdeg();
+    prevMs = millis();
+    uint32_t t0 = millis();
+    smooth = ss;
+    r.decay = TAU_COAST_MS / 1000.0f;   // if it never falls, report the ceiling
+
+    while (millis() - t0 < TAU_COAST_MS) {
+        delay(TAU_SAMPLE_MS);
+        uint32_t now = millis();
+        float dt = (now - prevMs) / 1000.0f;
+        float yaw = imu.getGyroZdeg();
+        float inst = (dt > 0.0f) ? fabsf(yawDelta(prevYaw, yaw)) / dt : 0.0f;
+        prevYaw = yaw; prevMs = now;
+        smooth = 0.7f * smooth + 0.3f * inst;
+        if (smooth <= 0.368f * ss) { r.decay = (now - t0) / 1000.0f; break; }
+    }
+
+    r.ok = true;
+    return r;
+}
+
+static void testMotorTau(IMU& imu, MecanumDrive& drive) {
+    Serial.println(F("\n=== TEST 7: motor time constant (tau) ==="));
+    Serial.println(F("Robot on the FLOOR with ~1 m clear all round."));
+    Serial.println(F("It will spin up in place, then coast, three times."));
+    Serial.println(F("Do NOT hold or touch it -- contact changes the result."));
+    waitForEnter(F("Press ENTER to begin..."));
+
+    float rises[3], decays[3];
+
+    for (int i = 0; i < 3; i++) {
+        Serial.printf("\npass %d: spinning up at %d%%...\n", i + 1, TAU_TEST_PCT);
+        TauResult r = measureTauOnce(imu, drive);
+        if (!r.ok) { Serial.println(F("Aborting.")); drive.drive(0, 0, 0); return; }
+        rises[i]  = r.rise;
+        decays[i] = r.decay;
+        Serial.printf("  steady %.0f deg/s | rise %.2f s | decay %.2f s\n",
+                      r.steady, r.rise, r.decay);
+        delay(1200);   // let it come fully to rest before the next pass
+    }
+
+    drive.drive(0, 0, 0);
+
+    float riseTau  = medianOf3(rises[0],  rises[1],  rises[2]);
+    float decayTau = medianOf3(decays[0], decays[1], decays[2]);
+
+    Serial.println(F("\n--- RESULTS ---"));
+    Serial.printf("rise  passes: %.2f %.2f %.2f -> median %.2f s\n",
+                  rises[0], rises[1], rises[2], riseTau);
+    Serial.printf("decay passes: %.2f %.2f %.2f -> median %.2f s\n",
+                  decays[0], decays[1], decays[2], decayTau);
+
+    // The constant is defined on the rising edge, so that is what is emitted.
+    Serial.printf("\n>>> constexpr float ODOM_MOTOR_TAU = %.2ff;\n", riseTau);
+
+    if (fabsf(riseTau - decayTau) > 0.5f * riseTau) {
+        Serial.println(F("\n!! Rise and decay differ by more than 50%."));
+        Serial.println(F("!! A first-order lag is a rough fit for this drivetrain."));
+        Serial.println(F("!! Usually means friction dominates the coast-down"));
+        Serial.println(F("!! (decay much faster than rise). The rise figure is the"));
+        Serial.println(F("!! one the model wants; expect some error either way."));
+    }
+
+    Serial.println(F("\nNOTE: measured while ROTATING. Forward tau may differ."));
+    Serial.println(F("Re-run TEST 2 afterwards -- it uses tau to compute top speed."));
+    Serial.println(F("\nPaste the >>> line into OdomConstants.h and reflash."));
+}
+
+// ---------------------------------------------------------------------------
 void runOdometryCalibration(IMU& imu, MecanumDrive& drive, MecanumOdometry& odom) {
     Serial.println(F("\n\n########################################"));
     Serial.println(F("#   ODOMETRY CALIBRATION MODE          #"));
@@ -303,6 +451,7 @@ void runOdometryCalibration(IMU& imu, MecanumDrive& drive, MecanumOdometry& odom
         Serial.println(F("  4  Deadband (manual, you watch it)"));
         Serial.println(F("  5  Live pose stream"));
         Serial.println(F("  6  Deadband (automatic, sensor-measured)"));
+        Serial.println(F("  7  Motor time constant (tau)"));
         Serial.print(F("Choose: "));
 
         while (Serial.available()) Serial.read();
@@ -333,6 +482,7 @@ void runOdometryCalibration(IMU& imu, MecanumDrive& drive, MecanumOdometry& odom
                 break;
             }
             case 6: testDeadbandAuto(imu, drive); break;
+            case 7: testMotorTau(imu, drive); break;
             default: Serial.println(F("Unknown option.")); break;
         }
         drive.drive(0, 0, 0);
