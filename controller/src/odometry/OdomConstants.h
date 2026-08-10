@@ -56,7 +56,7 @@ constexpr float ODOM_MOTOR_TAU = 0.25f;
 
 //  Command percent below which the robot does not actually move -- static
 //  friction plus motor-driver deadzone.
-constexpr float ODOM_DEADBAND_PCT = 8.0f;
+constexpr float ODOM_DEADBAND_PCT = 18.0f;
 
 
 // ---------------------------------------------------------------------------
