@@ -1,13 +1,15 @@
 # pip install pynput
 
 import math
+import os
 import socket
 import threading
 import time
 
 from pynput import keyboard
 
-ECHO_IP = "192.168.4.1"
+# See the note in xbox_control.py -- DHCP address, overridable via ECHO_IP.
+ECHO_IP = os.environ.get("ECHO_IP", "192.168.68.85")
 ECHO_PORT = 8888
 SPEED = 12
 
