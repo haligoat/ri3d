@@ -25,7 +25,7 @@
 //  Assumes the IMU is mounted FLAT, so its Z axis is the yaw axis. A flat board
 //  rotated in yaw needs no correction at all -- odom.begin() latches whatever
 //  heading it reads at boot as theta = 0, absorbing any fixed mounting angle.
-constexpr int8_t ODOM_YAW_SIGN = +1;
+constexpr int8_t ODOM_YAW_SIGN = -1;
 
 
 // ---------------------------------------------------------------------------
@@ -47,8 +47,8 @@ constexpr float ODOM_WHEEL_DIAMETER_M = 0.067f;
 //
 //  Strafing is always slower: mecanum rollers waste much of the force
 //  sideways. Expect roughly 0.5-0.8x of forward.
-constexpr float ODOM_MAX_FORWARD_SPEED = 2.0f;
-constexpr float ODOM_MAX_STRAFE_SPEED  = 1.4f;
+constexpr float ODOM_MAX_FORWARD_SPEED = 1.28f;
+constexpr float ODOM_MAX_STRAFE_SPEED  = 0.98f;
 
 //  Time to reach ~63% of a commanded step change, seconds. Mass and gearing
 //  dominate this. Lower it if the estimate lags real motion.
